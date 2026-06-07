@@ -1,0 +1,130 @@
+name: Build Mira macOS updater
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Mira Desktop branch, tag, or SHA to build.
+        required: true
+        default: codex/mira-updater-1.1.6
+      version:
+        description: Release version to stamp into package.json before packaging.
+        required: true
+        default: 1.1.6
+      publish:
+        description: Publish or update the GitHub release.
+        required: true
+        default: 'true'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mira-release-${{ github.event.inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    name: Build and publish Mira ${{ github.event.inputs.version }}
+    runs-on: macos-14
+    timeout-minutes: 90
+    env:
+      ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
+      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/.cache/electron-builder
+    steps:
+      - name: Checkout Mira Desktop source
+        uses: actions/checkout@v4
+        with:
+          repository: SavFx2025/mira-desktop
+          ref: ${{ github.event.inputs.source_ref }}
+          token: ${{ secrets.MIRA_DESKTOP_SOURCE_TOKEN }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install uv for packaged Sentinel runtime
+        run: brew install uv
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Stamp release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ github.event.inputs.version }}"
+          if [[ ! "$version" =~ ^[0-9]+[.][0-9]+[.][0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: $version" >&2
+            exit 1
+          fi
+          npm version "$version" --no-git-tag-version
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build renderer and Electron main/preload
+        run: npm run build
+
+      - name: Build macOS updater zip
+        run: npx electron-builder --mac zip --arm64 --publish never
+
+      - name: Validate macOS updater metadata
+        run: npm run release:validate -- --platform=mac
+
+      - name: Collect release assets
+        id: assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          zip="release/Mira-${version}-arm64.zip"
+          blockmap="${zip}.blockmap"
+          metadata="release/latest-mac.yml"
+          for file in "$zip" "$blockmap" "$metadata"; do
+            if [[ ! -s "$file" ]]; then
+              echo "Missing release asset: $file" >&2
+              exit 1
+            fi
+          done
+          {
+            echo "zip=$zip"
+            echo "blockmap=$blockmap"
+            echo "metadata=$metadata"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          cat > release-notes.md <<'EOF'
+          Mira ${{ steps.version.outputs.version }}
+
+          - Shows the installed Mira version in the sidebar/footer account area.
+          - Renames the updater action to show the target version, for example "Update Mira to v${{ steps.version.outputs.version }}".
+          - Keeps downloaded/ready/installing update states from being overwritten by background checks.
+          - Shows a clear update failure state instead of making the updater row disappear.
+
+          This release includes the macOS updater zip and latest-mac.yml metadata.
+          EOF
+
+      - name: Publish updater release
+        if: ${{ github.event.inputs.publish == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          assets=(
+            "${{ steps.assets.outputs.zip }}"
+            "${{ steps.assets.outputs.blockmap }}"
+            "${{ steps.assets.outputs.metadata }}"
+          )
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "${{ steps.version.outputs.version }}" --notes-file release-notes.md --draft=false --prerelease=false
+          else
+            gh release create "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --title "${{ steps.version.outputs.version }}" --notes-file release-notes.md
+          fi
